@@ -1,0 +1,30 @@
+{
+  "best_model_name": "Tuned GB",
+  "requires_scaling": false,
+  "residual_std": 0.4606829639392537,
+  "n_features": 36,
+  "n_players": 1008,
+  "test_size": 202,
+  "train_size": 806,
+  "rf_best_params": {
+    "max_depth": 10,
+    "min_samples_leaf": 15,
+    "n_estimators": 800
+  },
+  "xgb_best_params": {
+    "colsample_bytree": 0.7,
+    "learning_rate": 0.005,
+    "max_depth": 3,
+    "n_estimators": 1000,
+    "reg_alpha": 1.0,
+    "reg_lambda": 1.0,
+    "subsample": 0.7
+  },
+  "gb_best_params": {
+    "learning_rate": 0.005,
+    "max_depth": 4,
+    "min_samples_leaf": 15,
+    "n_estimators": 800,
+    "subsample": 0.7
+  }
+}

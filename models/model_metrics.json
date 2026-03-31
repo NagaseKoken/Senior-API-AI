@@ -1,0 +1,96 @@
+{
+  "Linear Regression": {
+    "Train R2": 0.7525,
+    "Test R2": 0.7544,
+    "CV R2 Mean": 0.7158,
+    "CV R2 Std": 0.0668,
+    "MAE": 1012227.0,
+    "RMSE": 1801154.0,
+    "Within 30%": 58.4
+  },
+  "Ridge": {
+    "Train R2": 0.7517,
+    "Test R2": 0.7588,
+    "CV R2 Mean": 0.7179,
+    "CV R2 Std": 0.0676,
+    "MAE": 1007760.0,
+    "RMSE": 1709404.0,
+    "Within 30%": 57.9
+  },
+  "Lasso": {
+    "Train R2": 0.7449,
+    "Test R2": 0.7669,
+    "CV R2 Mean": 0.7199,
+    "CV R2 Std": 0.0586,
+    "MAE": 962017.0,
+    "RMSE": 1634030.0,
+    "Within 30%": 56.9
+  },
+  "Random Forest": {
+    "Train R2": 0.9403,
+    "Test R2": 0.706,
+    "CV R2 Mean": 0.6731,
+    "CV R2 Std": 0.0591,
+    "MAE": 1144103.0,
+    "RMSE": 2043658.0,
+    "Within 30%": 55.9
+  },
+  "Gradient Boosting": {
+    "Train R2": 0.9744,
+    "Test R2": 0.6821,
+    "CV R2 Mean": 0.6477,
+    "CV R2 Std": 0.0455,
+    "MAE": 1156918.0,
+    "RMSE": 2044132.0,
+    "Within 30%": 53.0
+  },
+  "XGBoost": {
+    "Train R2": 0.972,
+    "Test R2": 0.6859,
+    "CV R2 Mean": 0.6452,
+    "CV R2 Std": 0.0505,
+    "MAE": 1171124.0,
+    "RMSE": 2055947.0,
+    "Within 30%": 50.0
+  },
+  "Tuned RF": {
+    "Train R2": 0.7809,
+    "Test R2": 0.7119,
+    "CV R2 Mean": 0.6941,
+    "CV R2 Std": 0.0599,
+    "MAE": 1159936.0,
+    "RMSE": 2168250.0,
+    "Within 30%": 53.0,
+    "Range Accuracy": 73.3
+  },
+  "Tuned XGBoost": {
+    "Train R2": 0.7983,
+    "Test R2": 0.7339,
+    "CV R2 Mean": 0.6894,
+    "CV R2 Std": 0.0582,
+    "MAE": 1090470.0,
+    "RMSE": 2038706.0,
+    "Within 30%": 52.5,
+    "Range Accuracy": 73.3
+  },
+  "Tuned GB": {
+    "Train R2": 0.8239,
+    "Test R2": 0.7355,
+    "CV R2 Mean": 0.6945,
+    "CV R2 Std": 0.0635,
+    "MAE": 1080967.0,
+    "RMSE": 2024428.0,
+    "Within 30%": 56.9,
+    "Range Accuracy": 73.3
+  },
+  "Stacking Ensemble": {
+    "Train R2": 0.7605,
+    "Test R2": 0.7609,
+    "CV R2 Mean": 0.7228,
+    "CV R2 Std": 0.0657,
+    "MAE": 1014246.0,
+    "RMSE": 1742722.0,
+    "Within 30%": 56.9,
+    "Range Accuracy": 73.3
+  }
+}

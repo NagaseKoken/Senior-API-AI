@@ -1,0 +1,80 @@
+{
+  "total_players": 1008,
+  "salary_mean": 3373048.8839285714,
+  "salary_median": 2180000.0,
+  "salary_min": 46338.0,
+  "salary_max": 31626269.0,
+  "salary_std": 3571192.024009367,
+  "leagues": {
+    "Premier League": {
+      "count": 233,
+      "mean_salary": 5361466.21888412,
+      "median_salary": 4216835.0,
+      "min_salary": 46338.0,
+      "max_salary": 31626269.0
+    },
+    "Bundesliga": {
+      "count": 203,
+      "mean_salary": 2867056.18226601,
+      "median_salary": 1890000.0,
+      "min_salary": 380000.0,
+      "max_salary": 20000000.0
+    },
+    "La Liga": {
+      "count": 188,
+      "mean_salary": 3513825.75,
+      "median_salary": 1880000.0,
+      "min_salary": 190000.0,
+      "max_salary": 31250000.0
+    },
+    "Serie A": {
+      "count": 229,
+      "mean_salary": 2504759.825327511,
+      "median_salary": 1670000.0,
+      "min_salary": 130000.0,
+      "max_salary": 16670000.0
+    },
+    "Ligue 1": {
+      "count": 155,
+      "mean_salary": 2158774.193548387,
+      "median_salary": 1550000.0,
+      "min_salary": 150000.0,
+      "max_salary": 16360000.0
+    }
+  },
+  "positions": {
+    "Defender": {
+      "count": 292,
+      "mean_salary": 2991705.2602739725,
+      "median_salary": 2108417.0
+    },
+    "Midfielder": {
+      "count": 391,
+      "mean_salary": 3400161.7033248083,
+      "median_salary": 2108417.0
+    },
+    "Attacker": {
+      "count": 247,
+      "mean_salary": 3731043.4979757085,
+      "median_salary": 2550000.0
+    },
+    "Goalkeeper": {
+      "count": 78,
+      "mean_salary": 3531081.653846154,
+      "median_salary": 2260000.0
+    }
+  },
+  "age_stats": {
+    "mean": 25.776785714285715,
+    "min": 17,
+    "max": 40
+  },
+  "final_metrics": {
+    "best_model": "Tuned GB",
+    "r2": 0.7355,
+    "mae": 1080967.0,
+    "rmse": 2024428.0,
+    "point_within_30": 56.9,
+    "range_accuracy_30": 73.3
+  }
+}
