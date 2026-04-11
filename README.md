@@ -86,7 +86,7 @@ graph LR
 | API-Football | `player_stats` | 4,394 | Appearances, goals, assists, match ratings |
 | Transfermarkt | `market_values` | 3,077 | Market value in EUR |
 
-All data is stored in a SQLite database (`data/football_data.db`) with tables linked via `player_pk` through the `player_identity` bridge table.
+All data is stored in a **PostgreSQL database hosted on Railway** and accessed at runtime via the `DATABASE_URL` environment variable. Tables are linked via `player_pk` through the `player_identity` bridge table.
 
 ### 3.2 Entity Resolution Pipeline
 
@@ -558,13 +558,14 @@ flowchart TB
     end
 
     subgraph Data["<b>Data Layer</b>"]
-        DB[("SQLite DB<br/><i>football_data.db</i>")]
+        DB[("PostgreSQL<br/><i>Railway Cloud</i>")]
         ExtAPI["API-Football<br/><i>Live stats</i>"]
     end
 
     subgraph External["<b>External Services</b>"]
         Gemini["Google Gemini API<br/><i>LLM explanations</i>"]
         APIFootball["API-Football v3<br/><i>Live player stats</i>"]
+        Railway["Railway Platform<br/><i>PostgreSQL + Hosting</i>"]
     end
 
     Client --> API
@@ -591,7 +592,7 @@ sequenceDiagram
     participant Client
     participant API as FastAPI Server
     participant APIF as API-Football
-    participant DB as SQLite DB
+    participant DB as PostgreSQL (Railway)
     participant RF as Random Forest
     participant LLM as Google Gemini
 
@@ -815,6 +816,7 @@ The prompt instructs the LLM to write like a football pundit -- conversational, 
 
 - Python 3.10+
 - pip package manager
+- A PostgreSQL database (the project uses **Railway** for cloud-hosted PostgreSQL)
 
 ### 9.2 Installation
 
@@ -827,7 +829,23 @@ cd AIMODELFINALLSSS
 pip install -r requirements.txt
 ```
 
-### 9.3 Training the Model
+### 9.3 Environment Variables
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and configure the following:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | **Yes** | PostgreSQL connection string (e.g. `postgresql://user:pass@host:port/dbname`) |
+| `FOOTBALL_API_KEY` | Yes | API-Football key for live player statistics |
+| `GEMINI_API_KEY` | Optional | Google Gemini key for LLM-powered salary explanations |
+
+The database is hosted on **Railway** and contains all player data across 5 tables (`player_identity`, `sofifa_attributes`, `player_stats`, `market_values`, `salaries`).
+
+### 9.4 Training the Model
 
 Run the model training script to generate all artifacts:
 
@@ -837,7 +855,7 @@ python scripts/save_model.py
 
 This trains all models, performs hyperparameter tuning, and saves artifacts to `models/`.
 
-### 9.4 Generating Academic Graphs
+### 9.5 Generating Academic Graphs
 
 ```bash
 python scripts/generate_graphs.py
@@ -845,22 +863,15 @@ python scripts/generate_graphs.py
 
 Generates 16 additional visualizations in `figures_api/`.
 
-### 9.5 Starting the API
+### 9.6 Starting the API
 
 ```bash
-# Set up API keys
-cp .env.example .env
-# Edit .env and add:
-#   FOOTBALL_API_KEY=your_key   (required for live predictions)
-#   GEMINI_API_KEY=your_key     (optional, for LLM explanations)
-
-# Start the server
 python -m uvicorn app:app --reload
 ```
 
 The API will be available at `http://localhost:8000`.
 
-### 9.6 API Documentation
+### 9.7 API Documentation
 
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
@@ -877,8 +888,7 @@ AIMODELFINALLSSS/
 ├── requirements.txt                    # Python dependencies
 ├── .env.example                        # Environment variable template
 ├── README.md                           # This file
-├── data/
-│   └── football_data.db                # SQLite database (5 tables)
+├── data/                               # (Local data artifacts, DB is on Railway PostgreSQL)
 ├── models/                             # Trained model artifacts
 │   ├── best_model.joblib               # Best tuned model (Stacking Ensemble)
 │   ├── rf_model.joblib                 # Random Forest (800 trees, for range predictions)
@@ -915,7 +925,9 @@ AIMODELFINALLSSS/
 | Google Gemini | LLM-powered natural language salary explanations |
 | pandas / NumPy | Data manipulation and numerical computing |
 | matplotlib / seaborn | Statistical data visualization |
-| SQLite | Lightweight relational data storage |
+| PostgreSQL | Cloud-hosted relational database on **Railway** |
+| psycopg2 | PostgreSQL adapter for Python |
+| Railway | Cloud platform for PostgreSQL hosting and app deployment |
 | joblib | Model serialization and artifact management |
 
 ---
@@ -990,7 +1002,7 @@ Contains agent/bonus/image-rights columns: False
 | API-Football | 4,394 | 1,008 | Match stats, appearances |
 | Transfermarkt | 3,077 | 1,008 | Market valuations |
 
-Entity resolution via `player_identity` bridge table ([`data/football_data.db`](data/football_data.db)).
+Entity resolution via `player_identity` bridge table in PostgreSQL (Railway).
 
 ![Constraint 5: Data Sources](figures/specs/constraint5_data_sources.png)
 
@@ -1026,7 +1038,7 @@ Verification output (specs_verification.py):
 
 **Status: PASS**
 
-Deployed on **Railway Pro** with HTTPS/TLS auto-provisioned, DDoS protection, and zero-downtime deployments.
+Deployed on **Railway Pro** with HTTPS/TLS auto-provisioned, DDoS protection, and zero-downtime deployments. The PostgreSQL database is also hosted on Railway, keeping the entire backend infrastructure on a single cloud platform.
 
 ```
 Live URL: https://senior-api-ai-production.up.railway.app/
