@@ -26,3 +26,8 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# SQLite temp files
+*.db-shm
+*.db-wal
+*.db-journal

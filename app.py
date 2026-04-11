@@ -13,8 +13,9 @@ API docs:
 
 import os
 import json
-import sqlite3
 import urllib.request
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import numpy as np
 import pandas as pd
 import joblib
@@ -40,9 +41,14 @@ STATE = {}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
-DB_PATH = os.path.join(BASE_DIR, 'data', 'football_data.db')
+DATABASE_URL = os.environ['DATABASE_URL']
 FIGURES_DIR = os.path.join(BASE_DIR, 'figures')
 FIGURES_API_DIR = os.path.join(BASE_DIR, 'figures_api')
+
+
+def get_db_connection():
+    """Return a new PostgreSQL connection."""
+    return psycopg2.connect(DATABASE_URL)
 
 
 def load_artifacts():
@@ -889,16 +895,21 @@ def fetch_player_from_api(api_football_id: int, season: int = 2026) -> dict:
 
 def fetch_past_season_appearances(api_football_id: int) -> dict:
     """Fetch total appearances from the player_stats table (past seasons stored in DB)."""
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        """SELECT season, SUM(appearances) as total_apps, SUM(minutes) as total_mins
-           FROM player_stats
-           WHERE api_football_id = ?
-           GROUP BY season
-           ORDER BY season DESC""",
-        (api_football_id,)
-    ).fetchall()
-    conn.close()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT season, SUM(appearances) as total_apps, SUM(minutes) as total_mins
+               FROM player_stats
+               WHERE api_football_id = %s
+               GROUP BY season
+               ORDER BY season DESC""",
+            (api_football_id,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
 
     if not rows:
         return {"total_appearances": 0, "seasons": [], "per_season": []}
@@ -914,46 +925,53 @@ def fetch_past_season_appearances(api_football_id: int) -> dict:
 
 def lookup_sofifa_by_api_id(api_football_id: int) -> dict:
     """Look up FIFA attributes and market value from the database using api_football_id."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # Find player_pk from player_identity
-    row = conn.execute(
-        "SELECT player_pk, canonical_name FROM player_identity WHERE api_football_id = ?",
-        (api_football_id,)
-    ).fetchone()
+        # Find player_pk from player_identity
+        cur.execute(
+            "SELECT player_pk, canonical_name FROM player_identity WHERE api_football_id = %s",
+            (api_football_id,)
+        )
+        row = cur.fetchone()
 
-    if row is None:
+        if row is None:
+            cur.close()
+            return None
+
+        player_pk = row["player_pk"]
+
+        # Get sofifa attributes
+        cur.execute(
+            """SELECT overall, potential, value_eur, wage_eur, age,
+                      international_reputation, shooting, passing, dribbling,
+                      defending, physic, league_level, movement_reactions,
+                      mentality_composure, release_clause_eur, preferred_foot,
+                      player_positions, player_traits, player_tags, club_name,
+                      skill_moves, weak_foot, work_rate
+               FROM sofifa_attributes WHERE player_pk = %s""",
+            (player_pk,)
+        )
+        sofifa = cur.fetchone()
+
+        # Get market value
+        cur.execute(
+            "SELECT market_value_eur FROM market_values WHERE player_pk = %s",
+            (player_pk,)
+        )
+        market = cur.fetchone()
+
+        # Get salary if available
+        cur.execute(
+            "SELECT gross_annual_eur FROM salaries WHERE player_pk = %s",
+            (player_pk,)
+        )
+        salary = cur.fetchone()
+
+        cur.close()
+    finally:
         conn.close()
-        return None
-
-    player_pk = row["player_pk"]
-
-    # Get sofifa attributes
-    sofifa = conn.execute(
-        """SELECT overall, potential, value_eur, wage_eur, age,
-                  international_reputation, shooting, passing, dribbling,
-                  defending, physic, league_level, movement_reactions,
-                  mentality_composure, release_clause_eur, preferred_foot,
-                  player_positions, player_traits, player_tags, club_name,
-                  skill_moves, weak_foot, work_rate
-           FROM sofifa_attributes WHERE player_pk = ?""",
-        (player_pk,)
-    ).fetchone()
-
-    # Get market value
-    market = conn.execute(
-        "SELECT market_value_eur FROM market_values WHERE player_pk = ?",
-        (player_pk,)
-    ).fetchone()
-
-    # Get salary if available
-    salary = conn.execute(
-        "SELECT gross_annual_eur FROM salaries WHERE player_pk = ?",
-        (player_pk,)
-    ).fetchone()
-
-    conn.close()
 
     if sofifa is None:
         return None
@@ -1140,14 +1158,19 @@ def predict_player(player_pk: int):
     # Fetch extra personality fields from sofifa_attributes
     extra = {}
     try:
-        conn = sqlite3.connect(DB_PATH)
-        sofifa_row = conn.execute(
-            """SELECT player_positions, player_traits, player_tags, club_name,
-                      skill_moves, weak_foot, work_rate
-               FROM sofifa_attributes WHERE player_pk = ?""",
-            (player_pk,)
-        ).fetchone()
-        conn.close()
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT player_positions, player_traits, player_tags, club_name,
+                          skill_moves, weak_foot, work_rate
+                   FROM sofifa_attributes WHERE player_pk = %s""",
+                (player_pk,)
+            )
+            sofifa_row = cur.fetchone()
+            cur.close()
+        finally:
+            conn.close()
         if sofifa_row:
             extra = {
                 'player_positions': sofifa_row[0],
@@ -1253,14 +1276,19 @@ def search_players(q: str = Query(..., min_length=1, description="Search query")
     summaries = [player_to_summary(row) for _, row in results.iterrows()]
 
     # Enrich with api_football_id from player_identity table
-    conn = sqlite3.connect(DB_PATH)
-    for s in summaries:
-        row = conn.execute(
-            "SELECT api_football_id FROM player_identity WHERE player_pk = ?",
-            (s['player_pk'],)
-        ).fetchone()
-        s['api_football_id'] = row[0] if row else None
-    conn.close()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        for s in summaries:
+            cur.execute(
+                "SELECT api_football_id FROM player_identity WHERE player_pk = %s",
+                (s['player_pk'],)
+            )
+            row = cur.fetchone()
+            s['api_football_id'] = row[0] if row else None
+        cur.close()
+    finally:
+        conn.close()
 
     return summaries
 
@@ -1268,15 +1296,20 @@ def search_players(q: str = Query(..., min_length=1, description="Search query")
 @app.get("/api/players/lookup", tags=["Players"])
 def lookup_api_football_id(q: str = Query(..., min_length=1, description="Player name to look up")):
     """Look up api_football_id by player name. Use this ID with /api/predict/live/{id}."""
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        """SELECT pi.api_football_id, pi.canonical_name, pi.nationality, pi.player_pk
-           FROM player_identity pi
-           WHERE pi.canonical_name LIKE ? AND pi.api_football_id IS NOT NULL
-           LIMIT 20""",
-        (f"%{q}%",)
-    ).fetchall()
-    conn.close()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT pi.api_football_id, pi.canonical_name, pi.nationality, pi.player_pk
+               FROM player_identity pi
+               WHERE pi.canonical_name ILIKE %s AND pi.api_football_id IS NOT NULL
+               LIMIT 20""",
+            (f"%{q}%",)
+        )
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
 
     if not rows:
         raise HTTPException(status_code=404, detail=f"No players found matching '{q}'")
