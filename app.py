@@ -153,22 +153,48 @@ def load_untrained_players_from_db():
                 SELECT s.player_pk, s.short_name, s.long_name, s.league_name,
                        s.club_name, s.overall, s.age, s.nationality_name,
                        s.player_positions,
+                       s.potential, s.value_eur, s.wage_eur,
+                       s.international_reputation, s.shooting, s.passing,
+                       s.dribbling, s.defending, s.physic, s.league_level,
+                       s.movement_reactions, s.mentality_composure,
+                       s.release_clause_eur, s.preferred_foot,
                        i.api_football_id, i.nationality,
                        sal.gross_annual_eur,
-                       (SELECT ps.position FROM player_stats ps
-                        WHERE ps.player_pk = s.player_pk AND ps.position IS NOT NULL
-                        ORDER BY ps.season DESC NULLS LAST LIMIT 1) AS stats_position
+                       mv.market_value_eur,
+                       ps.appearances, ps.minutes, ps.goals, ps.assists,
+                       ps.rating, ps.position AS stats_position
                 FROM sofifa_attributes s
                 LEFT JOIN player_identity i ON s.player_pk = i.player_pk
                 LEFT JOIN salaries sal ON sal.player_pk = s.player_pk
+                LEFT JOIN market_values mv ON mv.player_pk = s.player_pk
+                LEFT JOIN LATERAL (
+                    SELECT appearances, minutes, goals, assists, rating, position
+                    FROM player_stats
+                    WHERE player_pk = s.player_pk
+                    ORDER BY season DESC NULLS LAST
+                    LIMIT 1
+                ) ps ON true
                 WHERE s.league_name = ANY(%s)
                 """,
                 (list(UNTRAINED_LEAGUE_ALIASES.keys()),),
             )
+
+            def _nn(x):
+                return float(x) if x is not None else np.nan
+
             for r in cur.fetchall():
                 (pk, short_name, long_name, league_name, club_name, overall, age,
-                 nat_name, player_positions, api_id, nationality,
-                 gross_annual_eur, stats_position) = r
+                 nat_name, player_positions,
+                 potential, value_eur, wage_eur,
+                 international_reputation, shooting, passing,
+                 dribbling, defending, physic, league_level,
+                 movement_reactions, mentality_composure,
+                 release_clause_eur, preferred_foot,
+                 api_id, nationality,
+                 gross_annual_eur,
+                 market_value_eur,
+                 appearances, minutes, goals, assists,
+                 rating, stats_position) = r
                 if int(pk) in trained_pks:
                     continue
                 position = stats_position or _map_sofifa_position(player_positions) or 'Midfielder'
@@ -184,6 +210,26 @@ def load_untrained_players_from_db():
                     'age': int(age) if age is not None else 0,
                     'overall': int(overall) if overall is not None else 0,
                     'gross_annual_eur': float(gross_annual_eur) if gross_annual_eur is not None else np.nan,
+                    'potential': _nn(potential),
+                    'value_eur': _nn(value_eur),
+                    'wage_eur': _nn(wage_eur),
+                    'market_value_eur': _nn(market_value_eur),
+                    'appearances': _nn(appearances),
+                    'goals': _nn(goals),
+                    'assists': _nn(assists),
+                    'rating': _nn(rating),
+                    'shooting': _nn(shooting),
+                    'passing': _nn(passing),
+                    'dribbling': _nn(dribbling),
+                    'defending': _nn(defending),
+                    'physic': _nn(physic),
+                    'international_reputation': _nn(international_reputation),
+                    'movement_reactions': _nn(movement_reactions),
+                    'mentality_composure': _nn(mentality_composure),
+                    'release_clause_eur': _nn(release_clause_eur),
+                    'minutes': _nn(minutes),
+                    'league_level': _nn(league_level),
+                    'preferred_foot': preferred_foot,
                     'predicted_low_eur': np.nan,
                     'predicted_high_eur': np.nan,
                     'predicted_center_eur': np.nan,
@@ -2027,8 +2073,9 @@ def get_player(player_pk: int):
     """Get full details for a single player."""
     untrained = STATE.get('untrained_df')
     if untrained is not None and len(untrained) and (untrained['player_pk'] == player_pk).any():
-        return player_to_summary(untrained[untrained['player_pk'] == player_pk].iloc[0])
-    row = get_player_row(player_pk)
+        row = untrained[untrained['player_pk'] == player_pk].iloc[0]
+    else:
+        row = get_player_row(player_pk)
     summary = player_to_summary(row)
 
     # Add extra details
