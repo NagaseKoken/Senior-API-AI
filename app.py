@@ -1323,20 +1323,15 @@ def predict_player(player_pk: int):
     if untrained is not None and len(untrained) and (untrained['player_pk'] == player_pk).any():
         urow = untrained[untrained['player_pk'] == player_pk].iloc[0]
         api_id = urow.get('api_football_id')
-        has_id = pd.notna(api_id)
-        raise HTTPException(
-            status_code=409,
-            detail={
-                'message': (
-                    f"Player {urow['short_name']} is in {urow['league_name']} which is outside "
-                    f"the trained dataset. Use /api/predict/live/{int(api_id)} for a live prediction."
-                ) if has_id else (
-                    f"Player {urow['short_name']} is not in the trained dataset and has no api_football_id."
+        if not pd.notna(api_id):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Player {urow['short_name']} is not in the trained dataset and has no "
+                    f"api_football_id — cannot generate a live prediction."
                 ),
-                'api_football_id': int(api_id) if has_id else None,
-                'live_endpoint': f"/api/predict/live/{int(api_id)}" if has_id else None,
-            },
-        )
+            )
+        return predict_live(int(api_id), season=2026)
     row = get_player_row(player_pk)
     features = get_player_features(player_pk)
 
