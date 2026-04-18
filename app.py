@@ -200,6 +200,414 @@ def load_untrained_players_from_db():
     return df
 
 
+UNTRAINED_REFRESH_INTERVAL_DAYS = 7
+
+
+def _current_model_version() -> str:
+    cfg = STATE.get('model_config', {})
+    return f"{cfg.get('best_model_name', 'unknown')}:{cfg.get('n_features', 0)}"
+
+
+def ensure_predicted_salaries_table():
+    """Create the predicted_salaries cache table if it doesn't exist."""
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS predicted_salaries (
+                    player_pk             BIGINT PRIMARY KEY,
+                    predicted_low_eur     DOUBLE PRECISION NOT NULL,
+                    predicted_high_eur    DOUBLE PRECISION NOT NULL,
+                    predicted_center_eur  DOUBLE PRECISION NOT NULL,
+                    model_version         TEXT NOT NULL,
+                    computed_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_predicted_salaries_computed_at "
+                "ON predicted_salaries(computed_at);"
+            )
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not ensure predicted_salaries table: {e}")
+
+
+def build_player_features_from_db(player_pk: int):
+    """Assemble the raw feature dict for a player using DB-only sources (no live API).
+    Returns None if SoFIFA attributes are missing (can't predict without them).
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute(
+                """SELECT overall, potential, value_eur, wage_eur, age,
+                          international_reputation, shooting, passing, dribbling,
+                          defending, physic, league_level, movement_reactions,
+                          mentality_composure, release_clause_eur, preferred_foot,
+                          player_positions
+                   FROM sofifa_attributes WHERE player_pk = %s""",
+                (player_pk,),
+            )
+            sofifa = cur.fetchone()
+            if sofifa is None:
+                cur.close()
+                return None
+
+            cur.execute(
+                "SELECT market_value_eur FROM market_values WHERE player_pk = %s",
+                (player_pk,),
+            )
+            market = cur.fetchone()
+
+            cur.execute(
+                """SELECT appearances, minutes, goals, assists, rating, position
+                   FROM player_stats
+                   WHERE player_pk = %s
+                   ORDER BY season DESC NULLS LAST LIMIT 1""",
+                (player_pk,),
+            )
+            stats = cur.fetchone()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not load DB features for player_pk={player_pk}: {e}")
+        return None
+
+    position = (stats and stats.get('position')) or \
+        _map_sofifa_position(sofifa.get('player_positions')) or 'Midfielder'
+
+    def n(x):
+        return float(x) if x is not None else 0.0
+
+    return {
+        'overall': n(sofifa.get('overall')),
+        'potential': n(sofifa.get('potential')),
+        'value_eur': n(sofifa.get('value_eur')),
+        'wage_eur': n(sofifa.get('wage_eur')),
+        'age': n(sofifa.get('age')),
+        'international_reputation': n(sofifa.get('international_reputation')),
+        'shooting': n(sofifa.get('shooting')),
+        'passing': n(sofifa.get('passing')),
+        'dribbling': n(sofifa.get('dribbling')),
+        'defending': n(sofifa.get('defending')),
+        'physic': n(sofifa.get('physic')),
+        'league_level': n(sofifa.get('league_level')) or 1.0,
+        'movement_reactions': n(sofifa.get('movement_reactions')),
+        'mentality_composure': n(sofifa.get('mentality_composure')),
+        'release_clause_eur': n(sofifa.get('release_clause_eur')),
+        'market_value_eur': n(market.get('market_value_eur') if market else 0),
+        'appearances': n(stats.get('appearances') if stats else 0),
+        'minutes': n(stats.get('minutes') if stats else 0),
+        'goals': n(stats.get('goals') if stats else 0),
+        'assists': n(stats.get('assists') if stats else 0),
+        'rating': n(stats.get('rating') if stats else 0),
+        'preferred_foot': sofifa.get('preferred_foot') or 'Right',
+        'position': position,
+    }
+
+
+def compute_prediction_for_player(player_pk: int):
+    """Compute (low, high, center) in EUR for a single player using DB features.
+    Returns None if features can't be built.
+    """
+    data = build_player_features_from_db(player_pk)
+    if data is None:
+        return None
+    features = engineer_features(data)
+    center_log, low_log, high_log = predict_range_single(features)
+    return {
+        'low': float(np.expm1(low_log)),
+        'high': float(np.expm1(high_log)),
+        'center': float(np.expm1(center_log)),
+    }
+
+
+def load_cached_predictions(player_pks, model_version: str):
+    """Return {player_pk: (low, high, center)} for rows that are fresh (matching
+    model_version and within UNTRAINED_REFRESH_INTERVAL_DAYS)."""
+    if not player_pks:
+        return {}
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT player_pk, predicted_low_eur, predicted_high_eur, predicted_center_eur
+                FROM predicted_salaries
+                WHERE player_pk = ANY(%s)
+                  AND model_version = %s
+                  AND computed_at > now() - (%s || ' days')::interval
+                """,
+                ([int(pk) for pk in player_pks], model_version, str(UNTRAINED_REFRESH_INTERVAL_DAYS)),
+            )
+            rows = cur.fetchall()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not read predicted_salaries cache: {e}")
+        return {}
+    return {int(r[0]): (float(r[1]), float(r[2]), float(r[3])) for r in rows}
+
+
+def upsert_predicted_salary(player_pk: int, low: float, high: float,
+                            center: float, model_version: str):
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO predicted_salaries
+                    (player_pk, predicted_low_eur, predicted_high_eur,
+                     predicted_center_eur, model_version, computed_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (player_pk) DO UPDATE SET
+                    predicted_low_eur = EXCLUDED.predicted_low_eur,
+                    predicted_high_eur = EXCLUDED.predicted_high_eur,
+                    predicted_center_eur = EXCLUDED.predicted_center_eur,
+                    model_version = EXCLUDED.model_version,
+                    computed_at = EXCLUDED.computed_at
+                """,
+                (int(player_pk), float(low), float(high), float(center), model_version),
+            )
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not upsert predicted_salary for {player_pk}: {e}")
+
+
+def _load_bulk_features_from_db(player_pks):
+    """Load the raw feature dicts for many players in a single DB round-trip each.
+    Returns {player_pk: data_dict}. Players without SoFIFA attributes are omitted.
+    """
+    if not player_pks:
+        return {}
+    pks = [int(pk) for pk in player_pks]
+    sofifa_map = {}
+    market_map = {}
+    stats_map = {}
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute(
+                """SELECT player_pk, overall, potential, value_eur, wage_eur, age,
+                          international_reputation, shooting, passing, dribbling,
+                          defending, physic, league_level, movement_reactions,
+                          mentality_composure, release_clause_eur, preferred_foot,
+                          player_positions
+                   FROM sofifa_attributes WHERE player_pk = ANY(%s)""",
+                (pks,),
+            )
+            for r in cur.fetchall():
+                sofifa_map[int(r['player_pk'])] = r
+            cur.execute(
+                "SELECT player_pk, market_value_eur FROM market_values "
+                "WHERE player_pk = ANY(%s)",
+                (pks,),
+            )
+            for r in cur.fetchall():
+                market_map[int(r['player_pk'])] = r['market_value_eur']
+            cur.execute(
+                """
+                SELECT DISTINCT ON (player_pk)
+                       player_pk, appearances, minutes, goals, assists, rating, position
+                FROM player_stats
+                WHERE player_pk = ANY(%s)
+                ORDER BY player_pk, season DESC NULLS LAST
+                """,
+                (pks,),
+            )
+            for r in cur.fetchall():
+                stats_map[int(r['player_pk'])] = r
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not bulk-load features: {e}")
+        return {}
+
+    def n(x):
+        return float(x) if x is not None else 0.0
+
+    out = {}
+    for pk, sofifa in sofifa_map.items():
+        stats = stats_map.get(pk)
+        position = (stats and stats.get('position')) or \
+            _map_sofifa_position(sofifa.get('player_positions')) or 'Midfielder'
+        out[pk] = {
+            'overall': n(sofifa.get('overall')),
+            'potential': n(sofifa.get('potential')),
+            'value_eur': n(sofifa.get('value_eur')),
+            'wage_eur': n(sofifa.get('wage_eur')),
+            'age': n(sofifa.get('age')),
+            'international_reputation': n(sofifa.get('international_reputation')),
+            'shooting': n(sofifa.get('shooting')),
+            'passing': n(sofifa.get('passing')),
+            'dribbling': n(sofifa.get('dribbling')),
+            'defending': n(sofifa.get('defending')),
+            'physic': n(sofifa.get('physic')),
+            'league_level': n(sofifa.get('league_level')) or 1.0,
+            'movement_reactions': n(sofifa.get('movement_reactions')),
+            'mentality_composure': n(sofifa.get('mentality_composure')),
+            'release_clause_eur': n(sofifa.get('release_clause_eur')),
+            'market_value_eur': n(market_map.get(pk, 0)),
+            'appearances': n(stats.get('appearances') if stats else 0),
+            'minutes': n(stats.get('minutes') if stats else 0),
+            'goals': n(stats.get('goals') if stats else 0),
+            'assists': n(stats.get('assists') if stats else 0),
+            'rating': n(stats.get('rating') if stats else 0),
+            'preferred_foot': sofifa.get('preferred_foot') or 'Right',
+            'position': position,
+        }
+    return out
+
+
+def _bulk_upsert_predicted_salaries(rows, model_version: str):
+    """Upsert many predicted_salaries rows in a single transaction.
+    rows: iterable of (player_pk, low, high, center). computed_at is set server-side.
+    """
+    if not rows:
+        return
+    try:
+        from psycopg2.extras import execute_values
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            execute_values(
+                cur,
+                """
+                INSERT INTO predicted_salaries
+                    (player_pk, predicted_low_eur, predicted_high_eur,
+                     predicted_center_eur, model_version)
+                VALUES %s
+                ON CONFLICT (player_pk) DO UPDATE SET
+                    predicted_low_eur = EXCLUDED.predicted_low_eur,
+                    predicted_high_eur = EXCLUDED.predicted_high_eur,
+                    predicted_center_eur = EXCLUDED.predicted_center_eur,
+                    model_version = EXCLUDED.model_version,
+                    computed_at = now()
+                """,
+                [(int(pk), float(lo), float(hi), float(c), model_version)
+                 for pk, lo, hi, c in rows],
+                template="(%s, %s, %s, %s, %s)",
+            )
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not bulk-upsert predicted_salaries: {e}")
+
+
+def refresh_untrained_predictions():
+    """For each untrained player, populate predicted_low/high/center on untrained_df
+    using the DB cache when fresh, otherwise compute + upsert. Updates STATE in place.
+    Uses batched DB queries to avoid N+1.
+    """
+    df = STATE.get('untrained_df')
+    if df is None or len(df) == 0:
+        return
+    version = _current_model_version()
+    pks = [int(pk) for pk in df['player_pk'].tolist()]
+    cached = load_cached_predictions(pks, version)
+
+    missing_pks = [pk for pk in pks if pk not in cached]
+    bulk_data = _load_bulk_features_from_db(missing_pks)
+
+    new_rows = []
+    from_cache = 0
+    computed = 0
+    skipped = 0
+    predictions = {}
+
+    for pk in pks:
+        if pk in cached:
+            predictions[pk] = cached[pk]
+            from_cache += 1
+            continue
+        data = bulk_data.get(pk)
+        if data is None:
+            skipped += 1
+            continue
+        features = engineer_features(data)
+        center_log, low_log, high_log = predict_range_single(features)
+        low = float(np.expm1(low_log))
+        high = float(np.expm1(high_log))
+        center = float(np.expm1(center_log))
+        predictions[pk] = (low, high, center)
+        new_rows.append((pk, low, high, center))
+        computed += 1
+
+    _bulk_upsert_predicted_salaries(new_rows, version)
+
+    for i, row in df.iterrows():
+        pk = int(row['player_pk'])
+        if pk in predictions:
+            low, high, center = predictions[pk]
+            df.at[i, 'predicted_low_eur'] = low
+            df.at[i, 'predicted_high_eur'] = high
+            df.at[i, 'predicted_center_eur'] = center
+            df.at[i, 'prediction_available'] = True
+    print(f"   Refreshed {from_cache + computed}/{len(df)} untrained predictions "
+          f"({from_cache} from cache, {computed} computed, {skipped} skipped)")
+
+
+def compute_dataset_stats_dynamic():
+    """Build an overview-stats dict from the combined view so SPL is included."""
+    df = combined_players_view()
+    salaries = df['gross_annual_eur'].dropna()
+    leagues = {}
+    for league in sorted(df['league_name'].dropna().unique()):
+        ldf = df[df['league_name'] == league]
+        lsal = ldf['gross_annual_eur'].dropna()
+        leagues[str(league)] = {
+            'count': int(len(ldf)),
+            'mean_salary': float(lsal.mean()) if len(lsal) else None,
+            'median_salary': float(lsal.median()) if len(lsal) else None,
+            'min_salary': float(lsal.min()) if len(lsal) else None,
+            'max_salary': float(lsal.max()) if len(lsal) else None,
+        }
+    positions = {}
+    for pos in sorted(df['position'].dropna().unique()):
+        pdf = df[df['position'] == pos]
+        psal = pdf['gross_annual_eur'].fillna(pdf['predicted_center_eur']).dropna()
+        positions[str(pos)] = {
+            'count': int(len(pdf)),
+            'mean_salary': float(psal.mean()) if len(psal) else None,
+            'median_salary': float(psal.median()) if len(psal) else None,
+        }
+    ages = df['age'].dropna()
+    return {
+        'total_players': int(len(df)),
+        'salary_mean': float(salaries.mean()) if len(salaries) else 0.0,
+        'salary_median': float(salaries.median()) if len(salaries) else 0.0,
+        'salary_min': float(salaries.min()) if len(salaries) else 0.0,
+        'salary_max': float(salaries.max()) if len(salaries) else 0.0,
+        'salary_std': float(salaries.std()) if len(salaries) > 1 else 0.0,
+        'leagues': leagues,
+        'positions': positions,
+        'age_stats': {
+            'mean': float(ages.mean()) if len(ages) else 0.0,
+            'min': int(ages.min()) if len(ages) else 0,
+            'max': int(ages.max()) if len(ages) else 0,
+        },
+        'final_metrics': STATE['dataset_stats'].get('final_metrics', {}),
+    }
+
+
 def combined_players_view():
     """Return players_df + untrained_df concatenated, for list/search endpoints."""
     untrained = STATE.get('untrained_df')
@@ -216,7 +624,10 @@ async def lifespan(app: FastAPI):
     print(f"Loaded {len(STATE['players_df'])} players, {len(STATE['feature_names'])} features")
     enrich_players_df_from_db()
     STATE['players_df']['prediction_available'] = True
+    ensure_predicted_salaries_table()
     STATE['untrained_df'] = load_untrained_players_from_db()
+    refresh_untrained_predictions()
+    STATE['dataset_stats_dynamic'] = compute_dataset_stats_dynamic()
     yield
     STATE.clear()
 
@@ -801,7 +1212,7 @@ def build_prediction_response(
     actual_in_range = None
     range_accuracy_result = None
     distance_pct = None
-    actual_display = None
+    actual_display = "Unknown"
     if actual_salary is not None and actual_salary > 0:
         actual_display = fmt_eur(actual_salary)
         actual_in_range = low_eur <= actual_salary <= high_eur
@@ -921,7 +1332,7 @@ def player_to_summary(row) -> dict:
         'age': int(row['age']) if _clean_optional(row.get('age')) is not None else None,
         'overall': int(row['overall']) if _clean_optional(row.get('overall')) is not None else None,
         'actual_salary_eur': float(actual_raw) if actual_raw is not None else None,
-        'actual_salary_display': fmt_eur(actual_raw) if actual_raw is not None else None,
+        'actual_salary_display': fmt_eur(actual_raw) if actual_raw is not None else "Unknown",
         'predicted_low_eur': round(float(low_raw), 0) if low_raw is not None else None,
         'predicted_high_eur': round(float(high_raw), 0) if high_raw is not None else None,
         'predicted_center_eur': round(float(center_raw), 0) if center_raw is not None else None,
@@ -1322,16 +1733,38 @@ def predict_player(player_pk: int):
     untrained = STATE.get('untrained_df')
     if untrained is not None and len(untrained) and (untrained['player_pk'] == player_pk).any():
         urow = untrained[untrained['player_pk'] == player_pk].iloc[0]
-        api_id = urow.get('api_football_id')
-        if not pd.notna(api_id):
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Player {urow['short_name']} is not in the trained dataset and has no "
-                    f"api_football_id — cannot generate a live prediction."
-                ),
+        data = build_player_features_from_db(int(player_pk))
+        if data is not None:
+            features = engineer_features(data)
+            result = build_prediction_response(
+                features,
+                player_name=str(urow['short_name']),
+                actual_salary=None,
+                player_pk=int(player_pk),
+                position=data.get('position'),
+                league=str(urow['league_name']),
+                age=data.get('age'),
+                overall=data.get('overall'),
+                international_reputation=data.get('international_reputation'),
+                club_name=urow.get('club_name'),
             )
-        return predict_live(int(api_id), season=2026)
+            result['data_source'] = {
+                'stats': 'database (latest stored season)',
+                'fifa_attributes': 'database',
+                'note': 'Player not in trained dataset; actual salary unknown.',
+            }
+            return result
+        api_id = urow.get('api_football_id')
+        if pd.notna(api_id):
+            return predict_live(int(api_id), season=2026)
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Player {urow['short_name']} is not in the trained dataset and has "
+                f"insufficient data (no FIFA attributes, no api_football_id) — cannot "
+                f"generate a prediction."
+            ),
+        )
     row = get_player_row(player_pk)
     features = get_player_features(player_pk)
 
@@ -1546,7 +1979,8 @@ def search_api_football(q: str = Query(..., min_length=3, description="Player na
 @app.get("/api/players/top-overpaid", tags=["Players"])
 def top_overpaid(limit: int = Query(20, ge=1, le=100)):
     """Players with actual salary most above predicted range (overpaid)."""
-    df = STATE['players_df'].copy()
+    df = combined_players_view().copy()
+    df = df.dropna(subset=['gross_annual_eur', 'predicted_high_eur'])
     df['overpaid_amount'] = df['gross_annual_eur'] - df['predicted_high_eur']
     df = df[df['overpaid_amount'] > 0].sort_values('overpaid_amount', ascending=False).head(limit)
     return [{
@@ -1559,7 +1993,8 @@ def top_overpaid(limit: int = Query(20, ge=1, le=100)):
 @app.get("/api/players/top-underpaid", tags=["Players"])
 def top_underpaid(limit: int = Query(20, ge=1, le=100)):
     """Players with actual salary most below predicted range (underpaid)."""
-    df = STATE['players_df'].copy()
+    df = combined_players_view().copy()
+    df = df.dropna(subset=['gross_annual_eur', 'predicted_low_eur'])
     df['underpaid_amount'] = df['predicted_low_eur'] - df['gross_annual_eur']
     df = df[df['underpaid_amount'] > 0].sort_values('underpaid_amount', ascending=False).head(limit)
     return [{
@@ -1599,8 +2034,8 @@ def get_player(player_pk: int):
 
 @app.get("/api/analytics/overview", tags=["Analytics"])
 def dataset_overview():
-    """Get dataset overview statistics."""
-    stats = STATE['dataset_stats']
+    """Get dataset overview statistics (computed dynamically over trained + untrained)."""
+    stats = STATE.get('dataset_stats_dynamic') or STATE['dataset_stats']
     config = STATE['model_config']
     return {
         'total_players': stats['total_players'],
@@ -1660,30 +2095,42 @@ def league_stats():
 
 @app.get("/api/analytics/positions", tags=["Analytics"])
 def position_stats():
-    """Salary statistics by position."""
-    df = STATE['players_df']
+    """Salary statistics by position (actual salary when known, predicted center otherwise)."""
+    df = combined_players_view().copy()
+    df['_salary'] = df['gross_annual_eur'].fillna(df.get('predicted_center_eur'))
     result = []
     for pos in sorted(df['position'].dropna().unique()):
         pdf = df[df['position'] == pos]
+        salaries = pdf['_salary'].dropna()
+        if len(salaries) == 0:
+            continue
+        accuracy_rows = pdf.dropna(subset=['gross_annual_eur'])
         result.append({
             'position': pos,
             'player_count': int(len(pdf)),
-            'mean_salary': round(float(pdf['gross_annual_eur'].mean()), 0),
-            'median_salary': round(float(pdf['gross_annual_eur'].median()), 0),
-            'min_salary': round(float(pdf['gross_annual_eur'].min()), 0),
-            'max_salary': round(float(pdf['gross_annual_eur'].max()), 0),
-            'mean_overall': round(float(pdf['overall'].mean()), 1),
-            'mean_age': round(float(pdf['age'].mean()), 1),
-            'range_accuracy_pct': round(float(pdf['range_accuracy_result'].mean() * 100), 1),
-            'mean_salary_display': fmt_eur(pdf['gross_annual_eur'].mean()),
+            'mean_salary': round(float(salaries.mean()), 0),
+            'median_salary': round(float(salaries.median()), 0),
+            'min_salary': round(float(salaries.min()), 0),
+            'max_salary': round(float(salaries.max()), 0),
+            'mean_overall': round(float(pdf['overall'].dropna().mean()), 1)
+                if pdf['overall'].notna().any() else None,
+            'mean_age': round(float(pdf['age'].dropna().mean()), 1)
+                if pdf['age'].notna().any() else None,
+            'range_accuracy_pct': (
+                round(float(accuracy_rows['range_accuracy_result'].mean() * 100), 1)
+                if len(accuracy_rows) else None
+            ),
+            'mean_salary_display': fmt_eur(salaries.mean()),
         })
     return sorted(result, key=lambda x: x['median_salary'], reverse=True)
 
 
 @app.get("/api/analytics/age-analysis", tags=["Analytics"])
 def age_analysis():
-    """Salary by age buckets and peak earning age."""
-    df = STATE['players_df']
+    """Salary by age buckets and peak earning age (actual when known, predicted center otherwise)."""
+    df = combined_players_view().copy()
+    df['_salary'] = df['gross_annual_eur'].fillna(df.get('predicted_center_eur'))
+    df = df.dropna(subset=['_salary', 'age'])
 
     # Age buckets
     bins = [(17, 21), (21, 24), (24, 27), (27, 30), (30, 33), (33, 40)]
@@ -1694,14 +2141,19 @@ def age_analysis():
             buckets.append({
                 'age_range': f"{low}-{high-1}",
                 'player_count': int(len(bucket_df)),
-                'mean_salary': round(float(bucket_df['gross_annual_eur'].mean()), 0),
-                'median_salary': round(float(bucket_df['gross_annual_eur'].median()), 0),
-                'mean_overall': round(float(bucket_df['overall'].mean()), 1),
-                'mean_salary_display': fmt_eur(bucket_df['gross_annual_eur'].mean()),
+                'mean_salary': round(float(bucket_df['_salary'].mean()), 0),
+                'median_salary': round(float(bucket_df['_salary'].median()), 0),
+                'mean_overall': round(float(bucket_df['overall'].dropna().mean()), 1)
+                    if bucket_df['overall'].notna().any() else None,
+                'mean_salary_display': fmt_eur(bucket_df['_salary'].mean()),
             })
 
+    if len(df) == 0:
+        return {'age_buckets': buckets, 'peak_earning_age': None,
+                'peak_earning_salary': None, 'peak_earning_salary_display': None}
+
     # Peak earning age
-    age_salary = df.groupby('age')['gross_annual_eur'].mean()
+    age_salary = df.groupby('age')['_salary'].mean()
     peak_age = int(age_salary.idxmax())
 
     return {
