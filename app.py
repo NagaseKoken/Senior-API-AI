@@ -154,18 +154,21 @@ def load_untrained_players_from_db():
                        s.club_name, s.overall, s.age, s.nationality_name,
                        s.player_positions,
                        i.api_football_id, i.nationality,
+                       sal.gross_annual_eur,
                        (SELECT ps.position FROM player_stats ps
                         WHERE ps.player_pk = s.player_pk AND ps.position IS NOT NULL
                         ORDER BY ps.season DESC NULLS LAST LIMIT 1) AS stats_position
                 FROM sofifa_attributes s
                 LEFT JOIN player_identity i ON s.player_pk = i.player_pk
+                LEFT JOIN salaries sal ON sal.player_pk = s.player_pk
                 WHERE s.league_name = ANY(%s)
                 """,
                 (list(UNTRAINED_LEAGUE_ALIASES.keys()),),
             )
             for r in cur.fetchall():
                 (pk, short_name, long_name, league_name, club_name, overall, age,
-                 nat_name, player_positions, api_id, nationality, stats_position) = r
+                 nat_name, player_positions, api_id, nationality,
+                 gross_annual_eur, stats_position) = r
                 if int(pk) in trained_pks:
                     continue
                 position = stats_position or _map_sofifa_position(player_positions) or 'Midfielder'
@@ -180,7 +183,7 @@ def load_untrained_players_from_db():
                     'api_football_id': int(api_id) if api_id is not None else None,
                     'age': int(age) if age is not None else 0,
                     'overall': int(overall) if overall is not None else 0,
-                    'gross_annual_eur': np.nan,
+                    'gross_annual_eur': float(gross_annual_eur) if gross_annual_eur is not None else np.nan,
                     'predicted_low_eur': np.nan,
                     'predicted_high_eur': np.nan,
                     'predicted_center_eur': np.nan,
@@ -561,6 +564,16 @@ def refresh_untrained_predictions():
             df.at[i, 'predicted_high_eur'] = high
             df.at[i, 'predicted_center_eur'] = center
             df.at[i, 'prediction_available'] = True
+            actual = row.get('gross_annual_eur')
+            if pd.notna(actual) and float(actual) > 0:
+                actual_f = float(actual)
+                in_range = bool(low <= actual_f <= high)
+                ok, dist_pct = compute_range_accuracy_result(actual_f, low, high)
+                df.at[i, 'actual_in_range'] = in_range
+                df.at[i, 'range_accuracy_result'] = bool(ok)
+                if center > 0:
+                    df.at[i, 'prediction_error_pct'] = \
+                        abs(actual_f - center) / actual_f * 100.0
     print(f"   Refreshed {from_cache + computed}/{len(df)} untrained predictions "
           f"({from_cache} from cache, {computed} computed, {skipped} skipped)")
 
@@ -1736,10 +1749,12 @@ def predict_player(player_pk: int):
         data = build_player_features_from_db(int(player_pk))
         if data is not None:
             features = engineer_features(data)
+            actual = urow.get('gross_annual_eur')
+            actual_salary = float(actual) if pd.notna(actual) and float(actual) > 0 else None
             result = build_prediction_response(
                 features,
                 player_name=str(urow['short_name']),
-                actual_salary=None,
+                actual_salary=actual_salary,
                 player_pk=int(player_pk),
                 position=data.get('position'),
                 league=str(urow['league_name']),
@@ -1751,7 +1766,10 @@ def predict_player(player_pk: int):
             result['data_source'] = {
                 'stats': 'database (latest stored season)',
                 'fifa_attributes': 'database',
-                'note': 'Player not in trained dataset; actual salary unknown.',
+                'note': (
+                    'Player not in trained dataset.' if actual_salary is not None
+                    else 'Player not in trained dataset; actual salary unknown.'
+                ),
             }
             return result
         api_id = urow.get('api_football_id')
