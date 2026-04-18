@@ -79,12 +79,144 @@ def load_artifacts():
     return s
 
 
+def enrich_players_df_from_db():
+    """Add api_football_id, nationality (from player_identity) and club_name
+    (from sofifa_attributes) to players_df. Missing values become NaN.
+    """
+    df = STATE['players_df']
+    df['api_football_id'] = pd.NA
+    df['nationality'] = pd.NA
+    df['club_name'] = pd.NA
+    try:
+        conn = get_db_connection()
+        try:
+            pks = [int(x) for x in df['player_pk'].tolist()]
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT player_pk, api_football_id, nationality FROM player_identity "
+                "WHERE player_pk = ANY(%s)",
+                (pks,),
+            )
+            identity = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            cur.execute(
+                "SELECT player_pk, club_name FROM sofifa_attributes "
+                "WHERE player_pk = ANY(%s)",
+                (pks,),
+            )
+            clubs = {r[0]: r[1] for r in cur.fetchall()}
+            cur.close()
+        finally:
+            conn.close()
+
+        df['api_football_id'] = df['player_pk'].map(lambda pk: identity.get(int(pk), (None, None))[0])
+        df['nationality'] = df['player_pk'].map(lambda pk: identity.get(int(pk), (None, None))[1])
+        df['club_name'] = df['player_pk'].map(lambda pk: clubs.get(int(pk)))
+        print(f"   Enriched {df['api_football_id'].notna().sum()} players with api_football_id, "
+              f"{df['nationality'].notna().sum()} with nationality, "
+              f"{df['club_name'].notna().sum()} with club_name")
+    except Exception as e:
+        print(f"   WARNING: Could not enrich players_df from DB: {e}")
+
+
+UNTRAINED_LEAGUE_ALIASES = {
+    'Pro League': 'Saudi Pro League',
+}
+
+
+def _map_sofifa_position(player_positions):
+    if not player_positions:
+        return None
+    first = str(player_positions).split(',')[0].strip().upper()
+    if first == 'GK':
+        return 'Goalkeeper'
+    if first in ('CB', 'LB', 'RB', 'LWB', 'RWB'):
+        return 'Defender'
+    if first in ('CDM', 'CM', 'CAM', 'LM', 'RM'):
+        return 'Midfielder'
+    if first in ('LW', 'RW', 'CF', 'ST'):
+        return 'Attacker'
+    return None
+
+
+def load_untrained_players_from_db():
+    """Load players in the DB but not in players_df (e.g., Saudi Pro League).
+    Returned rows have null predictions and prediction_available=False.
+    """
+    trained_pks = set(int(pk) for pk in STATE['players_df']['player_pk'].tolist())
+    rows = []
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT s.player_pk, s.short_name, s.long_name, s.league_name,
+                       s.club_name, s.overall, s.age, s.nationality_name,
+                       s.player_positions,
+                       i.api_football_id, i.nationality,
+                       (SELECT ps.position FROM player_stats ps
+                        WHERE ps.player_pk = s.player_pk AND ps.position IS NOT NULL
+                        ORDER BY ps.season DESC NULLS LAST LIMIT 1) AS stats_position
+                FROM sofifa_attributes s
+                LEFT JOIN player_identity i ON s.player_pk = i.player_pk
+                WHERE s.league_name = ANY(%s)
+                """,
+                (list(UNTRAINED_LEAGUE_ALIASES.keys()),),
+            )
+            for r in cur.fetchall():
+                (pk, short_name, long_name, league_name, club_name, overall, age,
+                 nat_name, player_positions, api_id, nationality, stats_position) = r
+                if int(pk) in trained_pks:
+                    continue
+                position = stats_position or _map_sofifa_position(player_positions) or 'Midfielder'
+                rows.append({
+                    'player_pk': int(pk),
+                    'short_name': short_name or '',
+                    'long_name': long_name or short_name or '',
+                    'position': position,
+                    'league_name': UNTRAINED_LEAGUE_ALIASES.get(league_name, league_name),
+                    'club_name': club_name,
+                    'nationality': nationality or nat_name,
+                    'api_football_id': int(api_id) if api_id is not None else None,
+                    'age': int(age) if age is not None else 0,
+                    'overall': int(overall) if overall is not None else 0,
+                    'gross_annual_eur': np.nan,
+                    'predicted_low_eur': np.nan,
+                    'predicted_high_eur': np.nan,
+                    'predicted_center_eur': np.nan,
+                    'prediction_error_pct': np.nan,
+                    'actual_in_range': False,
+                    'range_accuracy_result': False,
+                    'prediction_available': False,
+                })
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   WARNING: Could not load untrained players: {e}")
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    print(f"   Loaded {len(df)} untrained players (e.g., Saudi Pro League)")
+    return df
+
+
+def combined_players_view():
+    """Return players_df + untrained_df concatenated, for list/search endpoints."""
+    untrained = STATE.get('untrained_df')
+    if untrained is None or len(untrained) == 0:
+        return STATE['players_df']
+    return pd.concat([STATE['players_df'], untrained], ignore_index=True, sort=False)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global STATE
     print("Loading model artifacts...")
     STATE = load_artifacts()
     print(f"Loaded {len(STATE['players_df'])} players, {len(STATE['feature_names'])} features")
+    enrich_players_df_from_db()
+    STATE['players_df']['prediction_available'] = True
+    STATE['untrained_df'] = load_untrained_players_from_db()
     yield
     STATE.clear()
 
@@ -749,24 +881,59 @@ def get_player_features(player_pk: int) -> np.ndarray:
     return STATE['feature_matrix'][idx[0]].reshape(1, -1)
 
 
+def _clean_optional(val):
+    if val is None or pd.isna(val):
+        return None
+    return val
+
+
 def player_to_summary(row) -> dict:
+    api_football_id = _clean_optional(row.get('api_football_id'))
+    nationality = _clean_optional(row.get('nationality'))
+    club_name = _clean_optional(row.get('club_name'))
+    actual_raw = _clean_optional(row.get('gross_annual_eur'))
+    low_raw = _clean_optional(row.get('predicted_low_eur'))
+    high_raw = _clean_optional(row.get('predicted_high_eur'))
+    center_raw = _clean_optional(row.get('predicted_center_eur'))
+    error_raw = _clean_optional(row.get('prediction_error_pct'))
+    prediction_available = bool(row.get('prediction_available', True)) and low_raw is not None and high_raw is not None
+
+    if not prediction_available:
+        status = 'prediction_not_available'
+    elif actual_raw is None:
+        status = 'unknown'
+    elif float(actual_raw) > float(high_raw):
+        status = 'overpaid'
+    elif float(actual_raw) < float(low_raw):
+        status = 'underpaid'
+    else:
+        status = 'fair'
+
     return {
         'player_pk': int(row['player_pk']),
+        'api_football_id': int(api_football_id) if api_football_id is not None else None,
         'short_name': str(row['short_name']),
         'long_name': str(row['long_name']),
         'position': str(row['position']),
         'league_name': str(row['league_name']),
-        'age': int(row['age']),
-        'overall': int(row['overall']),
-        'actual_salary_eur': float(row['gross_annual_eur']),
-        'actual_salary_display': fmt_eur(row['gross_annual_eur']),
-        'predicted_low_eur': round(float(row['predicted_low_eur']), 0),
-        'predicted_high_eur': round(float(row['predicted_high_eur']), 0),
-        'predicted_center_eur': round(float(row['predicted_center_eur']), 0),
-        'predicted_range_display': f"{fmt_eur(row['predicted_low_eur'])} - {fmt_eur(row['predicted_high_eur'])}",
-        'actual_in_range': bool(row['actual_in_range']),
-        'range_accuracy_result': bool(row['range_accuracy_result']),
-        'prediction_error_pct': round(float(row['prediction_error_pct']), 1),
+        'club_name': str(club_name) if club_name is not None else None,
+        'nationality': str(nationality) if nationality is not None else None,
+        'age': int(row['age']) if _clean_optional(row.get('age')) is not None else None,
+        'overall': int(row['overall']) if _clean_optional(row.get('overall')) is not None else None,
+        'actual_salary_eur': float(actual_raw) if actual_raw is not None else None,
+        'actual_salary_display': fmt_eur(actual_raw) if actual_raw is not None else None,
+        'predicted_low_eur': round(float(low_raw), 0) if low_raw is not None else None,
+        'predicted_high_eur': round(float(high_raw), 0) if high_raw is not None else None,
+        'predicted_center_eur': round(float(center_raw), 0) if center_raw is not None else None,
+        'predicted_range_display': (
+            f"{fmt_eur(low_raw)} - {fmt_eur(high_raw)}"
+            if low_raw is not None and high_raw is not None else None
+        ),
+        'actual_in_range': bool(row['actual_in_range']) if _clean_optional(row.get('actual_in_range')) is not None else False,
+        'range_accuracy_result': bool(row['range_accuracy_result']) if _clean_optional(row.get('range_accuracy_result')) is not None else False,
+        'prediction_error_pct': round(float(error_raw), 1) if error_raw is not None else None,
+        'prediction_available': prediction_available,
+        'status': status,
     }
 
 
@@ -1152,6 +1319,24 @@ def predict_live(
 @app.get("/api/predict/{player_pk}", tags=["Prediction"])
 def predict_player(player_pk: int):
     """Predict salary range for a player in the database."""
+    untrained = STATE.get('untrained_df')
+    if untrained is not None and len(untrained) and (untrained['player_pk'] == player_pk).any():
+        urow = untrained[untrained['player_pk'] == player_pk].iloc[0]
+        api_id = urow.get('api_football_id')
+        has_id = pd.notna(api_id)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                'message': (
+                    f"Player {urow['short_name']} is in {urow['league_name']} which is outside "
+                    f"the trained dataset. Use /api/predict/live/{int(api_id)} for a live prediction."
+                ) if has_id else (
+                    f"Player {urow['short_name']} is not in the trained dataset and has no api_football_id."
+                ),
+                'api_football_id': int(api_id) if has_id else None,
+                'live_endpoint': f"/api/predict/live/{int(api_id)}" if has_id else None,
+            },
+        )
     row = get_player_row(player_pk)
     features = get_player_features(player_pk)
 
@@ -1221,20 +1406,56 @@ def predict_batch(req: BatchPredictionRequest):
 
 @app.get("/api/players", tags=["Players"])
 def list_players(
-    league: Optional[str] = Query(None, description="Filter by league name"),
-    position: Optional[str] = Query(None, description="Filter by position"),
+    league: Optional[str] = Query(None, description="Filter by league name (substring match)"),
+    position: Optional[str] = Query(None, description="Filter by position (substring match)"),
+    q: Optional[str] = Query(None, description="Substring match against short_name, long_name, club_name"),
+    club: Optional[str] = Query(None, description="Exact match on club_name"),
+    nationality: Optional[str] = Query(None, description="Exact match on nationality"),
+    max_salary_eur: Optional[float] = Query(None, description="Include only players with actual_salary_eur <= this value"),
+    status: Optional[str] = Query(None, description="Filter by status: overpaid | fair | underpaid"),
     sort_by: str = Query("actual_salary", description="Sort field: actual_salary, overall, age, prediction_error"),
     order: str = Query("desc", description="Sort order: asc or desc"),
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
+    per_page: int = Query(50, ge=1, le=1000),
 ):
     """List all players with predicted ranges and actual salaries."""
-    df = STATE['players_df'].copy()
+    df = combined_players_view().copy()
 
     if league:
         df = df[df['league_name'].str.contains(league, case=False, na=False)]
     if position:
         df = df[df['position'].str.contains(position, case=False, na=False)]
+    if q:
+        q_lower = q.lower()
+        mask = (
+            df['short_name'].astype(str).str.lower().str.contains(q_lower, na=False)
+            | df['long_name'].astype(str).str.lower().str.contains(q_lower, na=False)
+        )
+        if 'club_name' in df.columns:
+            mask = mask | df['club_name'].astype(str).str.lower().str.contains(q_lower, na=False)
+        df = df[mask]
+    if club and 'club_name' in df.columns:
+        df = df[df['club_name'] == club]
+    if nationality and 'nationality' in df.columns:
+        df = df[df['nationality'] == nationality]
+    if max_salary_eur is not None:
+        df = df[df['gross_annual_eur'].fillna(0) <= max_salary_eur]
+    if status:
+        s = status.lower()
+        if s not in ('overpaid', 'fair', 'underpaid'):
+            raise HTTPException(
+                status_code=400,
+                detail="status must be one of: overpaid, fair, underpaid",
+            )
+        if 'prediction_available' in df.columns:
+            df = df[df['prediction_available'] == True]
+        if s == 'overpaid':
+            df = df[df['gross_annual_eur'] > df['predicted_high_eur']]
+        elif s == 'underpaid':
+            df = df[df['gross_annual_eur'] < df['predicted_low_eur']]
+        else:
+            df = df[(df['gross_annual_eur'] >= df['predicted_low_eur'])
+                    & (df['gross_annual_eur'] <= df['predicted_high_eur'])]
 
     sort_map = {
         'actual_salary': 'gross_annual_eur',
@@ -1266,31 +1487,14 @@ def list_players(
 @app.get("/api/players/search", tags=["Players"])
 def search_players(q: str = Query(..., min_length=1, description="Search query")):
     """Search players by name (fuzzy match). Returns api_football_id for use with /api/predict/live/."""
-    df = STATE['players_df']
+    df = combined_players_view()
     q_lower = q.lower()
     mask = (
-        df['short_name'].str.lower().str.contains(q_lower, na=False) |
-        df['long_name'].str.lower().str.contains(q_lower, na=False)
+        df['short_name'].astype(str).str.lower().str.contains(q_lower, na=False) |
+        df['long_name'].astype(str).str.lower().str.contains(q_lower, na=False)
     )
     results = df[mask].head(20)
-    summaries = [player_to_summary(row) for _, row in results.iterrows()]
-
-    # Enrich with api_football_id from player_identity table
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        for s in summaries:
-            cur.execute(
-                "SELECT api_football_id FROM player_identity WHERE player_pk = %s",
-                (s['player_pk'],)
-            )
-            row = cur.fetchone()
-            s['api_football_id'] = row[0] if row else None
-        cur.close()
-    finally:
-        conn.close()
-
-    return summaries
+    return [player_to_summary(row) for _, row in results.iterrows()]
 
 
 @app.get("/api/players/lookup", tags=["Players"])
@@ -1373,6 +1577,9 @@ def top_underpaid(limit: int = Query(20, ge=1, le=100)):
 @app.get("/api/players/{player_pk}", tags=["Players"])
 def get_player(player_pk: int):
     """Get full details for a single player."""
+    untrained = STATE.get('untrained_df')
+    if untrained is not None and len(untrained) and (untrained['player_pk'] == player_pk).any():
+        return player_to_summary(untrained[untrained['player_pk'] == player_pk].iloc[0])
     row = get_player_row(player_pk)
     summary = player_to_summary(row)
 
@@ -1424,26 +1631,36 @@ def dataset_overview():
 @app.get("/api/analytics/leagues", tags=["Analytics"])
 def league_stats():
     """Salary statistics by league."""
-    df = STATE['players_df']
+    df = combined_players_view()
     result = []
-    for league in sorted(df['league_name'].unique()):
+    for league in sorted(df['league_name'].dropna().unique()):
         ldf = df[df['league_name'] == league]
-        top_player = ldf.loc[ldf['gross_annual_eur'].idxmax()]
-        result.append({
+        salaries = ldf['gross_annual_eur'].dropna()
+        has_salary = len(salaries) > 0
+        entry = {
             'league': league,
             'player_count': int(len(ldf)),
-            'mean_salary': round(float(ldf['gross_annual_eur'].mean()), 0),
-            'median_salary': round(float(ldf['gross_annual_eur'].median()), 0),
-            'min_salary': round(float(ldf['gross_annual_eur'].min()), 0),
-            'max_salary': round(float(ldf['gross_annual_eur'].max()), 0),
-            'std_salary': round(float(ldf['gross_annual_eur'].std()), 0),
-            'mean_overall': round(float(ldf['overall'].mean()), 1),
-            'top_paid_player': str(top_player['short_name']),
-            'top_paid_salary': round(float(top_player['gross_annual_eur']), 0),
-            'range_accuracy_pct': round(float(ldf['range_accuracy_result'].mean() * 100), 1),
-            'mean_salary_display': fmt_eur(ldf['gross_annual_eur'].mean()),
-        })
-    return sorted(result, key=lambda x: x['median_salary'], reverse=True)
+            'has_salary_data': has_salary,
+            'mean_salary': round(float(salaries.mean()), 0) if has_salary else None,
+            'median_salary': round(float(salaries.median()), 0) if has_salary else None,
+            'min_salary': round(float(salaries.min()), 0) if has_salary else None,
+            'max_salary': round(float(salaries.max()), 0) if has_salary else None,
+            'std_salary': round(float(salaries.std()), 0) if has_salary and len(salaries) > 1 else None,
+            'mean_overall': round(float(ldf['overall'].dropna().mean()), 1) if ldf['overall'].notna().any() else None,
+            'top_paid_player': None,
+            'top_paid_salary': None,
+            'range_accuracy_pct': (
+                round(float(ldf['range_accuracy_result'].mean() * 100), 1)
+                if has_salary and 'range_accuracy_result' in ldf.columns else None
+            ),
+            'mean_salary_display': fmt_eur(salaries.mean()) if has_salary else None,
+        }
+        if has_salary:
+            top_row = ldf.loc[ldf['gross_annual_eur'].idxmax()]
+            entry['top_paid_player'] = str(top_row['short_name'])
+            entry['top_paid_salary'] = round(float(top_row['gross_annual_eur']), 0)
+        result.append(entry)
+    return sorted(result, key=lambda x: (x['median_salary'] or -1), reverse=True)
 
 
 @app.get("/api/analytics/positions", tags=["Analytics"])
